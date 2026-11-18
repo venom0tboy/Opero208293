@@ -1,0 +1,168 @@
+name: RDP-Windows2
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rdp:
+    runs-on: windows-2025
+    timeout-minutes: 360
+
+    steps:
+      - name: Configure RDP (NLA on, Tailscale-only firewall)
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 2 -Force
+          Disable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+          Remove-NetFirewallRule -DisplayName "RDP-Tailscale" -ErrorAction SilentlyContinue
+          New-NetFirewallRule -DisplayName "RDP-Tailscale" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -RemoteAddress 100.64.0.0/10
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP user
+        shell: pwsh
+        env:
+          RDP_USER: ${{ secrets.RDP_USER }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RDP_USER) -or [string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+              Write-Error "RDP_USER or RDP_PASSWORD secret is missing."
+              exit 1
+          }
+          if (Get-LocalUser -Name $env:RDP_USER -ErrorAction SilentlyContinue) {
+              Remove-LocalUser -Name $env:RDP_USER
+          }
+          $securePass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          New-LocalUser -Name $env:RDP_USER -Password $securePass -AccountNeverExpires -PasswordNeverExpires -ErrorAction Stop | Out-Null
+          Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USER -ErrorAction Stop
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USER -ErrorAction Stop
+          Write-Host "User created and added to groups."
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Connect to Tailscale
+        shell: pwsh
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & $ts up --authkey="$env:TS_AUTHKEY" --hostname="gh-win-$env:GITHUB_RUN_ID" --unattended
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "tailscale up failed (check TAILSCALE_AUTH_KEY)."
+              exit 1
+          }
+          $tsIP = $null
+          for ($i = 0; $i -lt 12 -and -not $tsIP; $i++) {
+              $tsIP = (& $ts ip -4 2>$null | Select-Object -First 1)
+              if (-not $tsIP) { Start-Sleep -Seconds 5 }
+          }
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned."
+              exit 1
+          }
+          "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP port
+        shell: pwsh
+        run: |
+          $r = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $r.TcpTestSucceeded) {
+              Write-Error "RDP port 3389 is not reachable."
+              exit 1
+          }
+          Write-Host "RDP port is reachable."
+
+      # --- الخطوات الجديدة تبدأ من هنا ---
+      - name: Install Python Packages
+        shell: pwsh
+        run: |
+          # قائمة المكتبات المطلوبة (تمت إضافة urllib3 و requests)
+          $packages = @(
+              "curl_cffi",
+              "phonenumbers",
+              "PyExecJS",
+              "user-agents",
+              "colorama",
+              "faker",
+              "tlsmask",
+              "urllib3",
+              "requests"
+          )
+          # تثبيت كل مكتبة على حدة
+          foreach ($pkg in $packages) {
+              Write-Host "Installing $pkg..."
+              python -m pip install $pkg
+              if ($LASTEXITCODE -ne 0) {
+                  Write-Error "Failed to install $pkg"
+                  exit 1
+              }
+          }
+          Write-Host "All Python packages installed successfully."
+
+      - name: Install Node.js
+        shell: pwsh
+        run: |
+          # تحميل أحدث إصدار LTS من Node.js وتثبيته بصمت
+          Write-Host "Fetching latest Node.js LTS version..."
+          $nodeIndex = Invoke-RestMethod -Uri "https://nodejs.org/dist/index.json"
+          $ltsVersion = ($nodeIndex | Where-Object { $_.lts -ne $false } | Select-Object -First 1).version
+          if (-not $ltsVersion) {
+              Write-Error "Could not determine latest Node.js LTS version."
+              exit 1
+          }
+          Write-Host "Latest LTS version: $ltsVersion"
+
+          $msiUrl = "https://nodejs.org/dist/$ltsVersion/node-$ltsVersion-x64.msi"
+          $msiPath = "$env:TEMP\node-installer.msi"
+          Invoke-WebRequest -Uri $msiUrl -OutFile $msiPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$msiPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $msiPath -Force
+
+          # تحديث PATH للجلسة الحالية والتحقق من التثبيت
+          $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+          node --version
+          npm --version
+          Write-Host "Node.js installed."
+
+      - name: Install Brave and Notepad++
+        shell: pwsh
+        run: |
+          # تثبيت Notepad++ باستخدام winget
+          Write-Host "Installing Notepad++..."
+          winget install -e --id Notepad++.Notepad++ --silent --accept-package-agreements --accept-source-agreements
+          if ($LASTEXITCODE -ne 0) {
+              Write-Warning "Winget installation of Notepad++ might have failed or already exist. Exit code: $LASTEXITCODE"
+          }
+
+          # تثبيت Brave باستخدام ملف التثبيت الرسمي (لضمان الموثوقية)
+          Write-Host "Installing Brave Browser..."
+          $braveInstaller = "$env:TEMP\brave_installer.exe"
+          $braveUrl = "https://brave-browser-downloads.s3.brave.com/latest/brave_installer-x64.exe"
+          Invoke-WebRequest -Uri $braveUrl -OutFile $braveInstaller
+          Start-Process -FilePath $braveInstaller -ArgumentList "--install", "--silent", "--system-level" -Wait
+          Remove-Item $braveInstaller -Force
+          Write-Host "Brave Browser installed."
+
+      # --- نهاية الخطوات الجديدة ---
+
+      - name: Keep alive
+        shell: pwsh
+        run: |
+          Write-Host "=== RDP READY ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username/Password: from your repo secrets"
+          Write-Host "================="
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP active"
+              Start-Sleep -Seconds 300
+          }
